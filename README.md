@@ -10,6 +10,11 @@ GTK4 + gtk4-layer-shell for the overlay and a small C helper for the window pict
 - **Live pictures** of every window, also those on other desktops or scrolled out of view, taken with
   `ext-image-copy-capture` (`tools/expose-shots.c`); the last pictures show at once while fresh ones arrive.
 - Colours from the active Noctalia palette, font from GTK, blur from an Umbriel layer rule (below).
+- **Alt+Tab mode**: `expose-toggle next` / `prev` open it with the window you used before this one selected, and step on
+  through the windows in the order you used them (it follows Umbriel's window events to know that order). Bind them
+  to Alt+Tab / Alt+Shift+Tab and it works as an app switcher that shows everything.
+- **Animation**: the cards fly from where their windows are to the grid and back (windows that are not on screen grow
+  in place); the backdrop fades. `EXPOSE_SLOWMO=8` plays it slower.
 - Runs in the background (no tray icon); `expose-toggle` opens it in milliseconds.
 
 ## Install
@@ -32,6 +37,8 @@ blur_optimized = false
 
 [keybinds]
 "Mod+Alt+Up" = { action = "spawn:expose-toggle", repeat = false }
+"Alt+Tab" = { action = "spawn:expose-toggle next", repeat = true }
+"Alt+Shift+Tab" = { action = "spawn:expose-toggle prev", repeat = true }
 ```
 
 It uses `umbriel windows --json` for the window list and the actions `window-focus:<id>` / `window-close:<id>`

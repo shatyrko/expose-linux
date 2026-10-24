@@ -47,7 +47,9 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gsk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 try:
     gi.require_version("GioUnix", "2.0")
@@ -68,6 +70,9 @@ SHOTS_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "expose-linu
 TYPE_RESET_S = 1.3          # typed letters are forgotten after this long without typing
 HOVER_PX = 4.0              # the pointer must move this far before hovering selects
 STARTUP_S = 0.6             # pointer events while the window opens are not movement
+SLOWMO = float(os.environ.get("EXPOSE_SLOWMO", "1"))     # >1: play the animations slower (to look at them)
+OPEN_S = 0.32 * SLOWMO      # cards fly from their windows to the grid
+CLOSE_S = 0.24 * SLOWMO     # ... and back
 GAP = 30                    # between cards
 LABEL_H = 40                # the line under a thumbnail (icon + title)
 MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 40, 56, 48
@@ -113,9 +118,8 @@ def rgba(hex_color: str, alpha: float) -> str:
 
 def make_css(p: dict) -> str:
     return f"""
-window.expose {{ background-color: {rgba(p['mSurface'], 0.50)}; }}
-.root {{ opacity: 0; transition: opacity 180ms ease-out; }}
-.root.in {{ opacity: 1; }}
+window.expose {{ background-color: {rgba(p['mSurface'], 0)}; transition: background-color 280ms ease-out; }}
+window.expose.in {{ background-color: {rgba(p['mSurface'], 0.50)}; }}
 .card {{ border-radius: 18px; padding: 8px 8px 6px 8px; transition: background-color 90ms, opacity 140ms; }}
 .card.selected {{ background-color: {rgba(p['mHover'], 0.62)}; box-shadow: inset 0 0 0 2px {rgba(p['mPrimary'], 0.7)}; }}
 .card.dim {{ opacity: 0.22; }}
@@ -205,6 +209,14 @@ def load_texture(path: str):
         return None
 
 
+def ease_out(t: float) -> float:
+    return 1 - (1 - t) ** 3
+
+
+def ease_in_out(t: float) -> float:
+    return t * t * (3 - 2 * t)
+
+
 def fit_rows(aspects: list, area_w: float, area_h: float):
     """The biggest common thumbnail height at which all cards fit in the area, packed in rows left to right.
     Returns (height, rows) with rows = lists of indexes."""
@@ -277,6 +289,9 @@ class Card(Gtk.Box):
         close.set_focusable(False)
         close.connect("clicked", lambda b: on_close(self))
         overlay.add_overlay(close)
+        self.fades = [self.placeholder, close]          # shown only when the card is (nearly) in place
+        if workspace_chip:
+            self.fades.append(chip)
         self.append(overlay)
         label = Gtk.Box(spacing=8)
         label.set_halign(Gtk.Align.CENTER)
@@ -289,6 +304,7 @@ class Card(Gtk.Box):
         label.append(title)
         self.title_label = title
         self.label_row = label
+        self.fades.append(label)
         self.append(label)
         self.key = f"{self.title_text} {name} {win.get('app_id', '')}".casefold()
 
@@ -304,8 +320,12 @@ class Card(Gtk.Box):
 
 
 class Expose(Gtk.ApplicationWindow):
-    def __init__(self, app, windows, icons, palette):
+    def __init__(self, app, windows, icons, palette, mru=(), step=None):
         super().__init__(application=app)
+        self.mru = list(mru)                 # window ids, the one used last first
+        self.step_at_start = step            # None, "next" or "prev": opened by Alt+Tab
+        self.progress = 0.0                  # 0 = cards on their windows, 1 = in the grid
+        self.anim_id = 0
         self.palette = palette
         self.add_css_class("expose")
         self.icons = icons
@@ -374,7 +394,9 @@ class Expose(Gtk.ApplicationWindow):
         css.load_from_string(make_css(self.palette))
         Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
         self.build_cards()
-        GLib.idle_add(lambda: self.root.add_css_class("in"))
+        self.prepare_flights()
+        self.set_progress(0.0)
+        GLib.idle_add(self.begin_open)
         self.start_shots()
         return GLib.SOURCE_REMOVE
 
@@ -401,6 +423,8 @@ class Expose(Gtk.ApplicationWindow):
         focused = next((i for i, c in enumerate(self.cards) if c.win.get("focused")), 0)
         self.layout_cards()
         self.select(focused)
+        if self.step_at_start:
+            self.step(self.step_at_start)
 
     def layout_cards(self):
         if not self.cards:
@@ -410,6 +434,7 @@ class Expose(Gtk.ApplicationWindow):
         height, rows = fit_rows([c.aspect for c in self.cards], area_w, area_h)
         for c in self.cards:
             c.resize(height)
+            c.shot_w, c.shot_h = int(height * c.aspect), int(height)
         block_h = len(rows) * (height + LABEL_H + 14) + (len(rows) - 1) * GAP
         y = MARGIN_TOP + (area_h - block_h) / 2
         for row in rows:
@@ -418,8 +443,73 @@ class Expose(Gtk.ApplicationWindow):
             for i in row:
                 c = self.cards[i]
                 self.board.move(c, x, y)
+                c.fx, c.fy = x, y
                 x += c.aspect * height + 16 + GAP
             y += height + LABEL_H + 14 + GAP
+
+    # -- the flight: cards zoom from where their windows are to the grid, and back ---------------------------------
+
+    def prepare_flights(self):
+        """For every card: the transform that puts its picture exactly over its real window (the start of the flight)."""
+        for c in self.cards:
+            w = c.win
+            x, y, ww, wh = w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0)
+            on_screen = (w.get("visible") and ww > 0 and wh > 0
+                         and x < self.W and y < self.H and x + ww > 0 and y + wh > 0)
+            c.on_screen = bool(on_screen)
+            if on_screen:
+                s0 = max(0.05, ww / max(1, c.shot_w))
+                c.flight = ((x - c.fx - 8 * s0), (y - c.fy - 8 * s0), s0)
+            else:                                   # not on screen: grow in place from a little smaller
+                s0 = 0.82
+                c.flight = ((1 - s0) * (c.shot_w + 16) / 2, (1 - s0) * (c.shot_h + LABEL_H) / 2, s0)
+
+    def set_progress(self, e: float):
+        """e: 0 = cards over their windows, 1 = the grid."""
+        self.progress = e
+        for c in self.cards:
+            if e >= 1.0 or not hasattr(c, "flight"):
+                self.board.move(c, c.fx, c.fy)                 # (Gtk.Fixed keeps a child's place as its transform)
+                c.set_opacity(1.0)
+                for widget in c.fades:
+                    widget.set_opacity(1.0)
+                continue
+            dx, dy, s0 = c.flight
+            s = s0 + (1 - s0) * e
+            tr = Gsk.Transform().translate(Graphene.Point().init(c.fx + dx * (1 - e), c.fy + dy * (1 - e))).scale(s, s)
+            self.board.set_child_transform(c, tr)
+            c.set_opacity(1.0 if c.on_screen else e)
+            late = max(0.0, min(1.0, (e - 0.55) / 0.45))
+            for widget in c.fades:
+                widget.set_opacity(late if widget is not c.placeholder else (e if e < 0.5 else 1.0))
+
+    def fly(self, direction: int, duration: float, done=None):
+        """Run the flight to the grid (+1) or back to the windows (-1) from where it is now."""
+        if self.anim_id:
+            self.remove_tick_callback(self.anim_id)
+            self.anim_id = 0
+        start, t0 = self.progress, time.monotonic()
+        target = 1.0 if direction > 0 else 0.0
+        span = abs(target - start) or 1.0
+
+        def tick(widget, clock):
+            t = min(1.0, (time.monotonic() - t0) / (duration * span))
+            lin = start + (target - start) * t
+            self.set_progress(ease_out(lin) if direction > 0 else ease_in_out(lin))
+            if t >= 1.0:
+                self.anim_id = 0
+                if direction > 0:
+                    self.set_progress(1.0)
+                if done:
+                    done()
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+        self.anim_id = self.add_tick_callback(tick)
+
+    def begin_open(self):
+        self.add_css_class("in")
+        self.fly(+1, OPEN_S)
+        return GLib.SOURCE_REMOVE
 
     # -- the pictures ----------------------------------------------------------------------------------------------
 
@@ -464,6 +554,25 @@ class Expose(Gtk.ApplicationWindow):
             self.cards[self.sel].remove_css_class("selected")
         self.sel = index
         self.cards[index].add_css_class("selected")
+
+    def mru_cards(self):
+        """The cards, the window used last first (windows never seen in use follow in strip order)."""
+        rank = {wid: i for i, wid in enumerate(self.mru)}
+        return sorted(self.cards, key=lambda c: rank.get(c.win_id, len(rank) + self.cards.index(c)))
+
+    def step(self, which):
+        """Alt+Tab (next) / Alt+Shift+Tab (prev): through the windows in the order they were used."""
+        order = self.mru_cards()
+        if not order:
+            return
+        current = self.cards[self.sel] if self.sel < len(self.cards) else order[0]
+        if self.step_at_start and not getattr(self, "stepped", False):
+            self.stepped = True
+            self.select(self.cards.index(order[1 % len(order)] if which == "next" else order[-1]))
+            return
+        self.stepped = True
+        i = order.index(current) if current in order else 0
+        self.select(self.cards.index(order[(i + (1 if which == "next" else -1)) % len(order)]))
 
     def centre(self, card):
         ok, rect = card.compute_bounds(self.board)
@@ -557,7 +666,8 @@ class Expose(Gtk.ApplicationWindow):
         elif name == "Down":
             self.move(0, 1)
         elif name in ("Tab", "ISO_Left_Tab"):
-            self.select((self.sel + (-1 if (state & Gdk.ModifierType.SHIFT_MASK) else 1)) % max(1, len(self.cards)))
+            self.stepped = True
+            self.step("prev" if (state & Gdk.ModifierType.SHIFT_MASK) else "next")
         elif name in ("Delete", "BackSpace"):
             if self.typed:
                 self.typed = self.typed[:-1]
@@ -602,7 +712,7 @@ class Expose(Gtk.ApplicationWindow):
 
     def activate(self, card):
         umbriel_msg(f"window-focus:{card.win_id}")
-        GLib.timeout_add(60, self.close_pad)
+        self.close_pad()
 
     def close_window(self, card):
         umbriel_msg(f"window-close:{card.win_id}")
@@ -634,15 +744,21 @@ class Expose(Gtk.ApplicationWindow):
 
     def close_if_inactive(self):
         if not self.is_active():
-            self.close_pad()
+            self.close_pad(animated=False)
         return GLib.SOURCE_REMOVE
 
-    def close_pad(self):
-        if not self.closing:
-            self.closing = True
-            if self.shots_proc is not None:
-                self.shots_proc.force_exit()
-            self.get_application().pad_closed(self)
+    def close_pad(self, animated=True):
+        if self.closing:
+            return GLib.SOURCE_REMOVE
+        self.closing = True
+        if self.shots_proc is not None:
+            self.shots_proc.force_exit()
+        app = self.get_application()
+        if animated and self.cards and self.W:
+            self.remove_css_class("in")                      # the backdrop fades while the cards fly back
+            self.fly(-1, CLOSE_S, done=lambda: app.pad_closed(self))
+        else:
+            app.pad_closed(self)
         return GLib.SOURCE_REMOVE
 
 
@@ -651,10 +767,18 @@ class App(Gtk.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.win = None
         self.icons = None
+        self.mru = []                 # window ids, the one used last first (kept from `umbriel subscribe windows`)
+        self.sub = None
+        self.sub_retry = 0
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
         self.hold()                                  # stays running with the window closed
+        for name in ("next", "prev"):                # Alt+Tab / Alt+Shift+Tab: `expose-toggle next|prev` over D-Bus
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda a, p, name=name: self.step(name))
+            self.add_action(action)
+        self.watch_windows()
 
     def do_activate(self):                           # `gdbus call ... org.freedesktop.Application.Activate`: the fast toggle
         self.toggle()
@@ -667,19 +791,75 @@ class App(Gtk.Application):
             self.release()
             self.quit()
             return 0
+        if "--step" in args:
+            self.step(args[args.index("--step") + 1] if args.index("--step") + 1 < len(args) else "next")
+            return 0
         self.toggle()
         return 0
+
+    # -- which window was used last ---------------------------------------------------------------------------------
+
+    def watch_windows(self):
+        self.note_windows(umbriel_windows())
+        try:
+            self.sub = Gio.Subprocess.new(["umbriel", "subscribe", "windows"], Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error:
+            self.sub = None
+            GLib.timeout_add_seconds(5, lambda: self.watch_windows() and False)
+            return
+        stream = Gio.DataInputStream.new(self.sub.get_stdout_pipe())
+        stream.read_line_async(GLib.PRIORITY_LOW, None, self.on_event_line, stream)
+
+    def on_event_line(self, stream, result, _):
+        try:
+            line, _len = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None:                              # the compositor restarted or went away: try again later
+            GLib.timeout_add_seconds(5, lambda: self.watch_windows() and False)
+            return
+        try:
+            data = json.loads(line).get("data")
+        except (ValueError, AttributeError):
+            data = None
+        if isinstance(data, list):
+            self.note_windows(data)
+        stream.read_line_async(GLib.PRIORITY_LOW, None, self.on_event_line, stream)
+
+    def note_windows(self, windows):
+        alive = [w.get("id") for w in windows if w.get("id")]
+        focused = next((w["id"] for w in windows if w.get("focused") and w.get("id")), None)
+        order = [i for i in self.mru if i in alive]
+        order += [i for i in alive if i not in order]
+        if focused:
+            order = [focused] + [i for i in order if i != focused]
+        self.mru = order
+
+    # -- open / close ------------------------------------------------------------------------------------------------
+
+    def step(self, which):
+        if self.win is None:
+            self.open(step=which)
+        else:
+            self.win.step(which)
+            self.win.keyboard_used()
 
     def toggle(self):
         if self.win is not None:
             self.win.close_pad()
-            return GLib.SOURCE_REMOVE
+        else:
+            self.open()
+        return GLib.SOURCE_REMOVE
+
+    def open(self, step=None):
         windows = umbriel_windows()
+        self.note_windows(windows)
         if self.icons is None:
             self.icons = AppIcons()
-        self.win = Expose(self, windows, self.icons, load_palette())
+        self.win = Expose(self, windows, self.icons, load_palette(), mru=self.mru, step=step)
+        if step:
+            self.win.keyboard_used()
         self.win.present()
-        return GLib.SOURCE_REMOVE
 
     def pad_closed(self, win):
         self.win = None
