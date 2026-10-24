@@ -1,0 +1,5 @@
+#!/bin/sh
+# Open / close Expose Linux at once (what keyboard shortcuts run): asks the background program over D-Bus,
+# which takes milliseconds; starts it when it is not running.
+gdbus call --session --dest dev.alecsh.ExposeLinux --object-path /dev/alecsh/ExposeLinux \
+    --method org.freedesktop.Application.Activate '{}' >/dev/null 2>&1 || exec expose-linux

@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Expose Linux: macOS Exposé / Mission Control for a Wayland desktop (wlr-layer-shell, Umbriel).
+
+One full-screen overlay over the blurred desktop with every window of every desktop as a live thumbnail, as big as
+they can be while they all fit. Keyboard first: arrows move, Enter opens the window, Esc closes, typing letters
+picks windows whose title or app starts with them (the others dim). The mouse works too: click a window to go to it,
+middle-click (or the x on a card) to close it, click the background to leave. The pointer disappears the moment the
+keyboard is used, and hovering selects only after the mouse really moves.
+
+The pictures come from `expose-shots` (ext-image-copy-capture, one frame of each window, also those on other desktops
+or scrolled out of view); the window list, focusing and closing go through `umbriel` (JSON window list, the actions
+window-focus:<id> and window-close:<id>). Colours come from the active Noctalia palette, the font from the GTK setting,
+the blur from the compositor (Umbriel layer rule for the namespace "expose-linux").
+
+It runs in the background with no tray icon; starting it again toggles it.
+
+    expose-linux               open / close it (starts the background program when it is not running)
+    expose-linux --background  only start the background program (login)
+    expose-linux --list        print the windows it would show
+    expose-linux --quit        stop the background program
+
+Needs: python-gobject, gtk4, gtk4-layer-shell, and `expose-shots` (built by install.sh).
+"""
+import ctypes.util
+import glob
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.parse
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+# gtk4-layer-shell must be loaded before libwayland-client: re-exec with it preloaded
+LAYER = ctypes.util.find_library("gtk4-layer-shell") or next(iter(glob.glob("/usr/lib/libgtk4-layer-shell.so*")), None)
+if (LAYER and "libgtk4-layer-shell" not in os.environ.get("LD_PRELOAD", "") and "--list" not in sys.argv
+        and not os.environ.get("EX_NO_EXEC")):
+    os.environ["LD_PRELOAD"] = (LAYER if LAYER.startswith("/") else f"/usr/lib/{LAYER}") + \
+        (":" + os.environ["LD_PRELOAD"] if os.environ.get("LD_PRELOAD") else "")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+try:
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+except (ValueError, ImportError):
+    LayerShell = None
+
+APP_ID = "dev.alecsh.ExposeLinux"
+NAMESPACE = "expose-linux"
+SHOTS_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "expose-linux")
+TYPE_RESET_S = 1.3          # typed letters are forgotten after this long without typing
+HOVER_PX = 4.0              # the pointer must move this far before hovering selects
+STARTUP_S = 0.6             # pointer events while the window opens are not movement
+GAP = 30                    # between cards
+LABEL_H = 40                # the line under a thumbnail (icon + title)
+MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 40, 56, 48
+
+FALLBACK = {
+    "mPrimary": "#b4befe", "mOnPrimary": "#1e1e2e", "mSurface": "#1e1e2e", "mOnSurface": "#cdd6f4",
+    "mSurfaceVariant": "#313244", "mOnSurfaceVariant": "#a6adc8", "mOutline": "#6c7086", "mHover": "#45475a",
+    "mOnHover": "#cdd6f4", "mError": "#f38ba8",
+}
+
+
+def load_palette() -> dict:
+    """The colours of the palette Noctalia is using now (dark or light), else the fallback."""
+    theme = {}
+    for path in ("~/.config/noctalia/config.toml", "~/.local/state/noctalia/settings.toml"):   # the second wins
+        try:
+            with open(os.path.expanduser(path), "rb") as f:
+                theme.update(tomllib.load(f).get("theme", {}))
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    mode = theme.get("shell_mode") or theme.get("mode") or "dark"
+    source = theme.get("source", "community")
+    candidates = []
+    if source == "community" and theme.get("community_palette"):
+        candidates.append(f"~/.local/state/noctalia/community-palettes/{urllib.parse.quote(theme['community_palette'])}.json")
+    if theme.get("custom_palette"):
+        candidates.append(f"~/.config/noctalia/palettes/{theme['custom_palette']}.json")
+    for path in candidates:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                colors = json.load(f).get(mode)
+            if isinstance(colors, dict):
+                return {**FALLBACK, **{k: v for k, v in colors.items() if isinstance(v, str)}}
+        except (OSError, ValueError):
+            continue
+    return dict(FALLBACK)
+
+
+def rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})"
+
+
+def make_css(p: dict) -> str:
+    return f"""
+window.expose {{ background-color: {rgba(p['mSurface'], 0.50)}; }}
+.root {{ opacity: 0; transition: opacity 180ms ease-out; }}
+.root.in {{ opacity: 1; }}
+.card {{ border-radius: 18px; padding: 8px 8px 6px 8px; transition: background-color 90ms, opacity 140ms; }}
+.card.selected {{ background-color: {rgba(p['mHover'], 0.62)}; box-shadow: inset 0 0 0 2px {rgba(p['mPrimary'], 0.7)}; }}
+.card.dim {{ opacity: 0.22; }}
+.shot {{ border-radius: 10px; background-color: {rgba(p['mSurfaceVariant'], 0.75)};
+  box-shadow: 0 6px 22px {rgba(p['mSurface'], 0.65)}, inset 0 0 0 1px {rgba(p['mOutline'], 0.45)}; }}
+.card .title {{ color: {p['mOnSurface']}; font-size: 14px; font-weight: 500; text-shadow: 0 1px 6px {rgba(p['mSurface'], 0.9)}; }}
+.chip {{ background-color: {rgba(p['mSurface'], 0.78)}; color: {p['mOnSurfaceVariant']}; border-radius: 10px;
+  padding: 1px 8px; font-size: 12px; font-weight: 600; }}
+button.close {{ min-width: 26px; min-height: 26px; padding: 0; border-radius: 13px; border: none;
+  background-color: {rgba(p['mSurface'], 0.88)}; color: {p['mOnSurface']};
+  box-shadow: inset 0 0 0 1px {rgba(p['mOutline'], 0.7)}; opacity: 0; transition: opacity 110ms; }}
+.card.selected button.close, .card:hover button.close {{ opacity: 1; }}
+button.close:hover {{ background-color: {p['mError']}; color: {p['mOnPrimary']}; }}
+.empty {{ color: {p['mOnSurfaceVariant']}; font-size: 20px; }}
+"""
+
+
+# -- the windows ------------------------------------------------------------------------------------------------------
+
+class AppIcons:
+    """app_id -> (display name, icon) from the desktop entries."""
+
+    def __init__(self):
+        self.by_key = {}
+        for info in Gio.AppInfo.get_all():
+            ident = (info.get_id() or "").removesuffix(".desktop").casefold()
+            keys = {ident, (info.get_executable() or "").rsplit("/", 1)[-1].casefold()}
+            if isinstance(info, DesktopAppInfo):
+                wm = info.get_startup_wm_class()
+                if wm:
+                    keys.add(wm.casefold())
+            for key in keys:
+                if key:
+                    self.by_key.setdefault(key, info)
+
+    def lookup(self, app_id: str):
+        info = self.by_key.get((app_id or "").casefold())
+        if info is None and app_id:
+            info = self.by_key.get(app_id.casefold().rsplit(".", 1)[-1])
+        name = (info.get_display_name() if info else None) or app_id or "?"
+        icon = (info.get_icon() if info else None) or Gio.ThemedIcon.new("application-x-executable")
+        return name, icon
+
+
+def umbriel_windows() -> list:
+    try:
+        out = subprocess.run(["umbriel", "windows", "--json"], capture_output=True, text=True, timeout=3).stdout
+        data = json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return data.get("ok", []) if isinstance(data, dict) else data
+
+
+def sorted_windows(wins: list) -> list:
+    """Desktop by desktop, then left to right along each desktop's strip."""
+    def key(w):
+        return (w.get("output", ""), w.get("workspace", ""), w.get("column", 0), w.get("row", 0), w.get("x", 0), w.get("y", 0))
+    return sorted(wins, key=key)
+
+
+def umbriel_msg(action: str):
+    try:
+        subprocess.Popen(["umbriel", "msg", action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as err:
+        print(f"expose-linux: umbriel msg failed: {err}", file=sys.stderr)
+
+
+def shots_command():
+    for candidate in (os.path.join(HERE, "tools", "expose-shots"), shutil.which("expose-shots")):
+        if candidate and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def load_texture(path: str):
+    """A Gdk texture from an expose-shots .raw file (a header line, then BGRA premultiplied pixels), or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        nl = data.index(b"\n")
+        w, h, stride = (int(v) for v in data[:nl].split())
+        if len(data) - nl - 1 < stride * h:
+            return None
+        return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                                     GLib.Bytes.new(data[nl + 1:nl + 1 + stride * h]), stride)
+    except (OSError, ValueError):
+        return None
+
+
+def fit_rows(aspects: list, area_w: float, area_h: float):
+    """The biggest common thumbnail height at which all cards fit in the area, packed in rows left to right.
+    Returns (height, rows) with rows = lists of indexes."""
+    def pack(h):
+        rows, row, width = [], [], 0.0
+        for i, a in enumerate(aspects):
+            w = h * a + 16                       # the card's padding
+            if row and width + GAP + w > area_w:
+                rows.append(row)
+                row, width = [], 0.0
+            width += (GAP if row else 0) + w
+            row.append(i)
+        rows.append(row)
+        return rows
+
+    def fits(h):
+        rows = pack(h)
+        return len(rows) * (h + LABEL_H + 14) + (len(rows) - 1) * GAP <= area_h
+
+    lo, hi = 40.0, min(area_h * 0.46, 520.0)
+    if fits(hi):
+        return hi, pack(hi)
+    for _ in range(24):
+        mid = (lo + hi) / 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo, pack(lo)
+
+
+class Card(Gtk.Box):
+    """One window: its picture over its title."""
+
+    def __init__(self, win: dict, name: str, icon, workspace_chip: str, on_close):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.win = win
+        self.win_id = win["id"]
+        self.app_name = name
+        self.title_text = win.get("title") or name
+        self.aspect = max(0.45, min(3.2, win.get("w", 16) / max(1, win.get("h", 10))))
+        self.add_css_class("card")
+        overlay = Gtk.Overlay()
+        self.shot = Gtk.Picture()
+        self.shot.set_content_fit(Gtk.ContentFit.COVER)
+        self.shot.set_can_shrink(True)
+        self.shot.add_css_class("shot")
+        self.shot.set_overflow(Gtk.Overflow.HIDDEN)
+        self.placeholder = Gtk.Image.new_from_gicon(icon)
+        self.placeholder.set_halign(Gtk.Align.CENTER)
+        self.placeholder.set_valign(Gtk.Align.CENTER)
+        self.placeholder.set_pixel_size(64)
+        overlay.set_child(self.shot)
+        overlay.add_overlay(self.placeholder)
+        if workspace_chip:
+            chip = Gtk.Label(label=workspace_chip)
+            chip.add_css_class("chip")
+            chip.set_halign(Gtk.Align.END)
+            chip.set_valign(Gtk.Align.START)
+            chip.set_margin_top(8)
+            chip.set_margin_end(8)
+            chip.set_can_target(False)
+            overlay.add_overlay(chip)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        close.add_css_class("close")
+        close.set_halign(Gtk.Align.START)
+        close.set_valign(Gtk.Align.START)
+        close.set_margin_top(8)
+        close.set_margin_start(8)
+        close.set_focusable(False)
+        close.connect("clicked", lambda b: on_close(self))
+        overlay.add_overlay(close)
+        self.append(overlay)
+        label = Gtk.Box(spacing=8)
+        label.set_halign(Gtk.Align.CENTER)
+        small = Gtk.Image.new_from_gicon(icon)
+        small.set_pixel_size(22)
+        label.append(small)
+        title = Gtk.Label(label=self.title_text)
+        title.add_css_class("title")
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        label.append(title)
+        self.title_label = title
+        self.label_row = label
+        self.append(label)
+        self.key = f"{self.title_text} {name} {win.get('app_id', '')}".casefold()
+
+    def set_texture(self, texture):
+        self.shot.set_paintable(texture)
+        self.placeholder.set_visible(False)
+
+    def resize(self, shot_h: float):
+        w = int(shot_h * self.aspect)
+        self.shot.set_size_request(w, int(shot_h))
+        self.title_label.set_max_width_chars(max(8, int(w / 9)))
+        self.label_row.set_size_request(w, -1)
+
+
+class Expose(Gtk.ApplicationWindow):
+    def __init__(self, app, windows, icons, palette):
+        super().__init__(application=app)
+        self.palette = palette
+        self.add_css_class("expose")
+        self.icons = icons
+        self.cards = []
+        self.sel = 0
+        self.W = self.H = 0
+        self.typed = ""
+        self.type_timer = 0
+        self.armed = False
+        self.last_ptr = None
+        self.base_ptr = None
+        self.was_active = False
+        self.closing = False
+        self.opened = time.monotonic()
+        self.shots_proc = None
+        self.windows = windows
+
+        if LayerShell is not None and LayerShell.is_supported():
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, NAMESPACE)
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+                LayerShell.set_anchor(self, edge, True)
+            LayerShell.set_exclusive_zone(self, -1)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+        else:
+            self.fullscreen()
+
+        self.root = Gtk.Overlay()
+        self.root.add_css_class("root")
+        self.root.set_hexpand(True)
+        self.root.set_vexpand(True)
+        self.set_child(self.root)
+        self.board = Gtk.Fixed()
+        self.root.set_child(self.board)
+        self.empty = Gtk.Label(label="No open windows")
+        self.empty.add_css_class("empty")
+        self.empty.set_halign(Gtk.Align.CENTER)
+        self.empty.set_valign(Gtk.Align.CENTER)
+        self.empty.set_visible(False)
+        self.root.add_overlay(self.empty)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self.on_motion)
+        motion.connect("enter", self.on_motion)
+        self.add_controller(motion)
+        click = Gtk.GestureClick(button=0)
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("released", self.on_click)
+        self.add_controller(click)
+        self.connect("notify::is-active", self.on_active)
+        self.add_tick_callback(self.wait_for_size)
+
+    # -- building --------------------------------------------------------------------------------------------------
+
+    def wait_for_size(self, widget, clock):
+        w, h = self.get_width(), self.get_height()
+        if w < 200 or h < 200:
+            return GLib.SOURCE_CONTINUE
+        self.W, self.H = w, h
+        css = Gtk.CssProvider()
+        css.load_from_string(make_css(self.palette))
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.build_cards()
+        GLib.idle_add(lambda: self.root.add_css_class("in"))
+        self.start_shots()
+        return GLib.SOURCE_REMOVE
+
+    def build_cards(self):
+        wins = sorted_windows(self.windows)
+        spaces = sorted({(w.get("output", ""), w.get("workspace", "")) for w in wins})
+        multi = len(spaces) > 1
+        for w in wins:
+            name, icon = self.icons.lookup(w.get("app_id", ""))
+            chip = ""
+            if multi:
+                chip = (w.get("workspace", "").rsplit(":", 1)[-1] or "").strip()
+                chip = f"Desktop {chip}" if chip else ""
+            card = Card(w, name, icon, chip, self.close_window)
+            motion = Gtk.EventControllerMotion()
+            motion.connect("enter", lambda c, x, y, card=card: self.on_card_hover(card))
+            card.add_controller(motion)
+            texture = load_texture(os.path.join(SHOTS_DIR, f"{w['id']}.raw"))      # the last picture, until a fresh one arrives
+            if texture is not None:
+                card.set_texture(texture)
+            self.cards.append(card)
+            self.board.put(card, 0, 0)
+        self.empty.set_visible(not self.cards)
+        focused = next((i for i, c in enumerate(self.cards) if c.win.get("focused")), 0)
+        self.layout_cards()
+        self.select(focused)
+
+    def layout_cards(self):
+        if not self.cards:
+            return
+        area_w = self.W - 2 * MARGIN_X
+        area_h = self.H - MARGIN_TOP - MARGIN_BOTTOM
+        height, rows = fit_rows([c.aspect for c in self.cards], area_w, area_h)
+        for c in self.cards:
+            c.resize(height)
+        block_h = len(rows) * (height + LABEL_H + 14) + (len(rows) - 1) * GAP
+        y = MARGIN_TOP + (area_h - block_h) / 2
+        for row in rows:
+            row_w = sum(self.cards[i].aspect * height + 16 for i in row) + GAP * (len(row) - 1)
+            x = (self.W - row_w) / 2
+            for i in row:
+                c = self.cards[i]
+                self.board.move(c, x, y)
+                x += c.aspect * height + 16 + GAP
+            y += height + LABEL_H + 14 + GAP
+
+    # -- the pictures ----------------------------------------------------------------------------------------------
+
+    def start_shots(self):
+        cmd = shots_command()
+        if cmd is None or not self.cards:
+            return
+        os.makedirs(SHOTS_DIR, exist_ok=True)
+        n = len(self.cards)
+        width = 1400 if n <= 3 else 1000 if n <= 8 else 760
+        try:
+            self.shots_proc = Gio.Subprocess.new([cmd, SHOTS_DIR, str(width)], Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as err:
+            print(f"expose-linux: expose-shots failed: {err.message}", file=sys.stderr)
+            return
+        stream = Gio.DataInputStream.new(self.shots_proc.get_stdout_pipe())
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_shot_line, stream)
+
+    def on_shot_line(self, stream, result, _):
+        try:
+            line, _len = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            return
+        if line is None or self.closing:
+            return
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "ok":
+            card = next((c for c in self.cards if c.win_id == parts[1]), None)
+            if card is not None:
+                texture = load_texture(os.path.join(SHOTS_DIR, f"{parts[1]}.raw"))
+                if texture is not None:
+                    card.set_texture(texture)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_shot_line, stream)
+
+    # -- selection -------------------------------------------------------------------------------------------------
+
+    def select(self, index):
+        if not self.cards:
+            return
+        index = max(0, min(len(self.cards) - 1, index))
+        if 0 <= self.sel < len(self.cards):
+            self.cards[self.sel].remove_css_class("selected")
+        self.sel = index
+        self.cards[index].add_css_class("selected")
+
+    def centre(self, card):
+        ok, rect = card.compute_bounds(self.board)
+        return (rect.get_x() + rect.get_width() / 2, rect.get_y() + rect.get_height() / 2) if ok else (0, 0)
+
+    def move(self, dx, dy):
+        if not self.cards:
+            return
+        cur = self.cards[self.sel]
+        cx, cy = self.centre(cur)
+        best, best_score = None, None
+        for i, c in enumerate(self.cards):
+            if i == self.sel or c.has_css_class("dim"):
+                continue
+            x, y = self.centre(c)
+            ax, ay = (x - cx) * dx, (y - cy) * dy          # distance along the direction asked
+            if ax + ay <= 4:
+                continue
+            across = abs(x - cx) if dy else abs(y - cy)
+            score = (ax + ay) + 2.5 * across
+            if best_score is None or score < best_score:
+                best, best_score = i, score
+        if best is not None:
+            self.select(best)
+        elif dx:                                           # at the end of a row: go on to the next / previous card
+            step = self.sel + dx
+            while 0 <= step < len(self.cards) and self.cards[step].has_css_class("dim"):
+                step += dx
+            if 0 <= step < len(self.cards):
+                self.select(step)
+
+    def keyboard_used(self):
+        self.armed = False
+        self.base_ptr = self.last_ptr
+        self.set_cursor_from_name("none")
+
+    def on_motion(self, ctrl, x, y):
+        self.last_ptr = (x, y)
+        if time.monotonic() - self.opened < STARTUP_S:
+            self.base_ptr = (x, y)
+            return
+        if self.base_ptr is None:
+            self.base_ptr = (x, y)
+            return
+        if not self.armed and math.hypot(x - self.base_ptr[0], y - self.base_ptr[1]) > HOVER_PX:
+            self.armed = True
+            self.set_cursor(None)
+
+    def on_card_hover(self, card):
+        if self.armed and card in self.cards:
+            self.select(self.cards.index(card))
+
+    # -- typing, keys ----------------------------------------------------------------------------------------------
+
+    def apply_filter(self):
+        text = self.typed.casefold()
+        first = None
+        for i, c in enumerate(self.cards):
+            match = not text or any(word.startswith(text) or text in c.key for word in [c.key])
+            (c.remove_css_class if match else c.add_css_class)("dim")
+            if match and first is None and text:
+                first = i
+        if first is not None:
+            self.select(first)
+
+    def clear_typed(self):
+        self.typed = ""
+        if self.type_timer:
+            GLib.source_remove(self.type_timer)
+            self.type_timer = 0
+        self.apply_filter()
+
+    def on_key(self, ctrl, keyval, keycode, state):
+        name = Gdk.keyval_name(keyval) or ""
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK):
+            return Gdk.EVENT_PROPAGATE
+        self.keyboard_used()
+        if name == "Escape":
+            if self.typed:
+                self.clear_typed()
+            else:
+                self.close_pad()
+        elif name in ("Return", "KP_Enter", "ISO_Enter"):
+            self.activate(self.cards[self.sel]) if self.cards else self.close_pad()
+        elif name == "Left":
+            self.move(-1, 0)
+        elif name == "Right":
+            self.move(1, 0)
+        elif name == "Up":
+            self.move(0, -1)
+        elif name == "Down":
+            self.move(0, 1)
+        elif name in ("Tab", "ISO_Left_Tab"):
+            self.select((self.sel + (-1 if (state & Gdk.ModifierType.SHIFT_MASK) else 1)) % max(1, len(self.cards)))
+        elif name in ("Delete", "BackSpace"):
+            if self.typed:
+                self.typed = self.typed[:-1]
+                self.apply_filter()
+            elif name == "Delete" and self.cards:
+                self.close_window(self.cards[self.sel])
+        elif len(name) == 1 or name == "space":
+            char = " " if name == "space" else name
+            if char.strip() or self.typed:
+                self.typed += char
+                if self.type_timer:
+                    GLib.source_remove(self.type_timer)
+                self.type_timer = GLib.timeout_add(int(TYPE_RESET_S * 1000), self.type_expired)
+                self.apply_filter()
+        return Gdk.EVENT_STOP
+
+    def type_expired(self):
+        self.type_timer = 0
+        self.typed = ""
+        self.apply_filter()
+        return GLib.SOURCE_REMOVE
+
+    # -- mouse -----------------------------------------------------------------------------------------------------
+
+    def on_click(self, gesture, n_press, x, y):
+        button = gesture.get_current_button()
+        widget = self.pick(x, y, Gtk.PickFlags.DEFAULT)
+        node = widget
+        while node is not None and not isinstance(node, (Card, Gtk.Button)):
+            node = node.get_parent()
+        if isinstance(node, Gtk.Button):
+            return                                        # the x on a card has its own handler
+        if isinstance(node, Card):
+            if button == 1:
+                self.activate(node)
+            elif button == 2:
+                self.close_window(node)
+        elif button == 1:
+            self.close_pad()
+
+    # -- doing things ----------------------------------------------------------------------------------------------
+
+    def activate(self, card):
+        umbriel_msg(f"window-focus:{card.win_id}")
+        GLib.timeout_add(60, self.close_pad)
+
+    def close_window(self, card):
+        umbriel_msg(f"window-close:{card.win_id}")
+        GLib.timeout_add(450, self.refresh_windows)
+
+    def refresh_windows(self):
+        """After a close request: drop the cards of windows that are gone and tidy the rest."""
+        if self.closing:
+            return GLib.SOURCE_REMOVE
+        alive = {w["id"] for w in umbriel_windows()}
+        gone = [c for c in self.cards if c.win_id not in alive]
+        if gone:
+            keep = self.cards[self.sel] if self.sel < len(self.cards) and self.cards[self.sel] not in gone else None
+            for c in gone:
+                self.cards.remove(c)
+                self.board.remove(c)
+            if not self.cards:
+                self.empty.set_visible(True)
+            else:
+                self.layout_cards()
+                self.select(self.cards.index(keep) if keep in self.cards else min(self.sel, len(self.cards) - 1))
+        return GLib.SOURCE_REMOVE
+
+    def on_active(self, *args):
+        if self.is_active():
+            self.was_active = True
+        elif self.was_active and not self.closing:
+            GLib.timeout_add(200, self.close_if_inactive)
+
+    def close_if_inactive(self):
+        if not self.is_active():
+            self.close_pad()
+        return GLib.SOURCE_REMOVE
+
+    def close_pad(self):
+        if not self.closing:
+            self.closing = True
+            if self.shots_proc is not None:
+                self.shots_proc.force_exit()
+            self.get_application().pad_closed(self)
+        return GLib.SOURCE_REMOVE
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.win = None
+        self.icons = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.hold()                                  # stays running with the window closed
+
+    def do_activate(self):                           # `gdbus call ... org.freedesktop.Application.Activate`: the fast toggle
+        self.toggle()
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        if "--background" in args:
+            return 0
+        if "--quit" in args:
+            self.release()
+            self.quit()
+            return 0
+        self.toggle()
+        return 0
+
+    def toggle(self):
+        if self.win is not None:
+            self.win.close_pad()
+            return GLib.SOURCE_REMOVE
+        windows = umbriel_windows()
+        if self.icons is None:
+            self.icons = AppIcons()
+        self.win = Expose(self, windows, self.icons, load_palette())
+        self.win.present()
+        return GLib.SOURCE_REMOVE
+
+    def pad_closed(self, win):
+        self.win = None
+        win.destroy()
+
+
+def main():
+    if "--list" in sys.argv:
+        for w in sorted_windows(umbriel_windows()):
+            print(f"{w['id']}  {w.get('workspace', '')}  {w.get('app_id', '')}  {w.get('title', '')}")
+        return 0
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        return 0
+    return App().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

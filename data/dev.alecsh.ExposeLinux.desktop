@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Expose
+Comment=All windows of all desktops at once
+Exec=expose-linux
+Icon=dev.alecsh.ExposeLinux
+Terminal=false
+Categories=Utility;
+StartupNotify=false
