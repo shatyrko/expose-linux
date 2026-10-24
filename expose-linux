@@ -130,6 +130,8 @@ window.expose.in {{ background-color: {rgba(p['mSurface'], 0.50)}; }}
 .card {{ border-radius: 18px; padding: 8px 8px 6px 8px; transition: background-color 90ms, opacity 140ms; }}
 .card.selected {{ background-color: {rgba(p['mHover'], 0.62)}; box-shadow: inset 0 0 0 2px {rgba(p['mPrimary'], 0.7)}; }}
 .card.dim {{ opacity: 0.22; }}
+.card.flying, .card.flying.selected {{ background: none; box-shadow: none; transition: none; }}
+.card.flying .shot {{ box-shadow: none; }}
 .shot {{ border-radius: 10px; background-color: {rgba(p['mSurfaceVariant'], 0.75)};
   box-shadow: 0 6px 22px {rgba(p['mSurface'], 0.65)}, inset 0 0 0 1px {rgba(p['mOutline'], 0.45)}; }}
 .card .title {{ color: {p['mOnSurface']}; font-size: 14px; font-weight: 500; text-shadow: 0 1px 6px {rgba(p['mSurface'], 0.9)}; }}
@@ -481,6 +483,7 @@ class Expose(Gtk.ApplicationWindow):
         self.progress = e
         for c in self.cards:
             if e >= 1.0 or not hasattr(c, "flight"):
+                c.remove_css_class("flying")
                 self.board.move(c, c.fx, c.fy)                 # (Gtk.Fixed keeps a child's place as its transform)
                 c.set_opacity(1.0)
                 for widget in c.fades:
@@ -490,7 +493,11 @@ class Expose(Gtk.ApplicationWindow):
             s = s0 + (1 - s0) * e
             tr = Gsk.Transform().translate(Graphene.Point().init(c.fx + dx * (1 - e), c.fy + dy * (1 - e))).scale(s, s)
             self.board.set_child_transform(c, tr)
-            c.set_opacity(1.0 if c.on_screen else min(1.0, e * 3.0))
+            c.set_opacity(min(1.0, e * (5.0 if c.on_screen else 3.0)))      # the real window shows through for a moment
+            if e < 0.9:                                   # in flight it is just the window's picture: no highlight, no frame
+                c.add_css_class("flying")
+            else:
+                c.remove_css_class("flying")
             late = max(0.0, min(1.0, (e - 0.55) / 0.45))
             for widget in c.fades:
                 widget.set_opacity(late if widget is not c.placeholder else (e if e < 0.5 else 1.0))
