@@ -77,8 +77,8 @@ TYPE_RESET_S = 1.3          # typed letters are forgotten after this long withou
 HOVER_PX = 4.0              # the pointer must move this far before hovering selects
 STARTUP_S = 0.6             # pointer events while the window opens are not movement
 SLOWMO = float(os.environ.get("EXPOSE_SLOWMO", "1"))     # >1: play the animations slower (to look at them)
-OPEN_S = 0.32 * SLOWMO      # cards fly from their windows to the grid
-CLOSE_S = 0.24 * SLOWMO     # ... and back
+OPEN_S = 0.30 * SLOWMO      # cards fly from their windows to the grid
+CLOSE_S = 0.20 * SLOWMO     # ... and back
 KANATA_ADDR = os.environ.get("KANATA_ADDR", "127.0.0.1:7070")      # Kanata's TCP server (--port): tells us when Alt is let go
 GAP = 30                    # between cards
 LABEL_H = 40                # the line under a thumbnail (icon + title)
@@ -125,7 +125,7 @@ def rgba(hex_color: str, alpha: float) -> str:
 
 def make_css(p: dict) -> str:
     return f"""
-window.expose {{ background-color: {rgba(p['mSurface'], 0)}; transition: background-color 280ms ease-out; }}
+window.expose {{ background-color: {rgba(p['mSurface'], 0.16)}; transition: background-color 240ms ease-out; }}
 window.expose.in {{ background-color: {rgba(p['mSurface'], 0.50)}; }}
 .card {{ border-radius: 18px; padding: 8px 8px 6px 8px; transition: background-color 90ms, opacity 140ms; }}
 .card.selected {{ background-color: {rgba(p['mHover'], 0.62)}; box-shadow: inset 0 0 0 2px {rgba(p['mPrimary'], 0.7)}; }}
@@ -217,7 +217,7 @@ def load_texture(path: str):
 
 
 def ease_out(t: float) -> float:
-    return 1 - (1 - t) ** 3
+    return 1 - (1 - t) ** 4
 
 
 def ease_in_out(t: float) -> float:
@@ -393,6 +393,7 @@ class Expose(Gtk.ApplicationWindow):
         self.add_controller(click)
         self.connect("notify::is-active", self.on_active)
         self.add_tick_callback(self.wait_for_size)
+        self.start_shots()                   # fresh pictures are already being taken while the window opens
 
     # -- building --------------------------------------------------------------------------------------------------
 
@@ -401,14 +402,10 @@ class Expose(Gtk.ApplicationWindow):
         if w < 200 or h < 200:
             return GLib.SOURCE_CONTINUE
         self.W, self.H = w, h
-        css = Gtk.CssProvider()
-        css.load_from_string(make_css(self.palette))
-        Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
         self.build_cards()
         self.prepare_flights()
         self.set_progress(0.0)
         GLib.idle_add(self.begin_open)
-        self.start_shots()
         return GLib.SOURCE_REMOVE
 
     def build_cards(self):
@@ -425,9 +422,13 @@ class Expose(Gtk.ApplicationWindow):
             motion = Gtk.EventControllerMotion()
             motion.connect("enter", lambda c, x, y, card=card: self.on_card_hover(card))
             card.add_controller(motion)
-            texture = load_texture(os.path.join(SHOTS_DIR, f"{w['id']}.raw"))      # the last picture, until a fresh one arrives
-            if texture is not None:
-                card.set_texture(texture)
+            textures = self.get_application().textures                          # the last picture, until a fresh one arrives
+            if w["id"] not in textures:
+                texture = load_texture(os.path.join(SHOTS_DIR, f"{w['id']}.raw"))
+                if texture is not None:
+                    textures[w["id"]] = texture
+            if w["id"] in textures:
+                card.set_texture(textures[w["id"]])
             self.cards.append(card)
             self.board.put(card, 0, 0)
         self.empty.set_visible(not self.cards)
@@ -471,9 +472,9 @@ class Expose(Gtk.ApplicationWindow):
             if on_screen:
                 s0 = max(0.05, ww / max(1, c.shot_w))
                 c.flight = ((x - c.fx - 8 * s0), (y - c.fy - 8 * s0), s0)
-            else:                                   # not on screen: grow in place from a little smaller
-                s0 = 0.82
-                c.flight = ((1 - s0) * (c.shot_w + 16) / 2, (1 - s0) * (c.shot_h + LABEL_H) / 2, s0)
+            else:                                   # not on screen: come out of the middle of the screen
+                s0 = 0.42
+                c.flight = ((self.W - c.shot_w * s0) / 2 - c.fx - 8 * s0, (self.H - c.shot_h * s0) / 2 - c.fy - 8 * s0, s0)
 
     def set_progress(self, e: float):
         """e: 0 = cards over their windows, 1 = the grid."""
@@ -489,7 +490,7 @@ class Expose(Gtk.ApplicationWindow):
             s = s0 + (1 - s0) * e
             tr = Gsk.Transform().translate(Graphene.Point().init(c.fx + dx * (1 - e), c.fy + dy * (1 - e))).scale(s, s)
             self.board.set_child_transform(c, tr)
-            c.set_opacity(1.0 if c.on_screen else e)
+            c.set_opacity(1.0 if c.on_screen else min(1.0, e * 3.0))
             late = max(0.0, min(1.0, (e - 0.55) / 0.45))
             for widget in c.fades:
                 widget.set_opacity(late if widget is not c.placeholder else (e if e < 0.5 else 1.0))
@@ -499,12 +500,16 @@ class Expose(Gtk.ApplicationWindow):
         if self.anim_id:
             self.remove_tick_callback(self.anim_id)
             self.anim_id = 0
-        start, t0 = self.progress, time.monotonic()
+        start, t0 = self.progress, None
         target = 1.0 if direction > 0 else 0.0
         span = abs(target - start) or 1.0
 
         def tick(widget, clock):
-            t = min(1.0, (time.monotonic() - t0) / (duration * span))
+            nonlocal t0
+            now = clock.get_frame_time() / 1e6                   # the frame's own time: steadier than the wall clock
+            if t0 is None:
+                t0 = now
+            t = min(1.0, (now - t0) / (duration * span))
             lin = start + (target - start) * t
             self.set_progress(ease_out(lin) if direction > 0 else ease_in_out(lin))
             if t >= 1.0:
@@ -526,10 +531,10 @@ class Expose(Gtk.ApplicationWindow):
 
     def start_shots(self):
         cmd = shots_command()
-        if cmd is None or not self.cards:
+        if cmd is None or not self.windows:
             return
         os.makedirs(SHOTS_DIR, exist_ok=True)
-        n = len(self.cards)
+        n = len(self.windows)
         width = 1400 if n <= 3 else 1000 if n <= 8 else 760
         try:
             self.shots_proc = Gio.Subprocess.new([cmd, SHOTS_DIR, str(width)], Gio.SubprocessFlags.STDOUT_PIPE)
@@ -548,10 +553,11 @@ class Expose(Gtk.ApplicationWindow):
             return
         parts = line.split()
         if len(parts) >= 2 and parts[0] == "ok":
-            card = next((c for c in self.cards if c.win_id == parts[1]), None)
-            if card is not None:
-                texture = load_texture(os.path.join(SHOTS_DIR, f"{parts[1]}.raw"))
-                if texture is not None:
+            texture = load_texture(os.path.join(SHOTS_DIR, f"{parts[1]}.raw"))
+            if texture is not None:
+                self.get_application().textures[parts[1]] = texture
+                card = next((c for c in self.cards if c.win_id == parts[1]), None)
+                if card is not None:
                     card.set_texture(texture)
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_shot_line, stream)
 
@@ -810,6 +816,9 @@ class App(Gtk.Application):
         self.icons = None
         self.layer = "base"           # Kanata's active layer ("opt" = Alt is held), from its TCP server
         self.kanata_ok = False
+        self.textures = {}            # window id -> last picture (kept between openings: they show at once)
+        self.css = None
+        self.palette = None
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -819,6 +828,24 @@ class App(Gtk.Application):
             action.connect("activate", lambda a, p, name=name: self.step(name))
             self.add_action(action)
         threading.Thread(target=self.kanata_loop, daemon=True).start()
+        GLib.idle_add(self.warm_up)
+
+    def warm_up(self):
+        """Do the slow first-time work now (desktop entries, the style sheet), not when the first Alt+Tab is pressed."""
+        if self.icons is None:
+            self.icons = AppIcons()
+        self.apply_palette()
+        return GLib.SOURCE_REMOVE
+
+    def apply_palette(self):
+        palette = load_palette()
+        if palette != self.palette:
+            self.palette = palette
+            if self.css is None:
+                self.css = Gtk.CssProvider()
+                Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            self.css.load_from_string(make_css(palette))
+        return palette
 
     def kanata_loop(self):
         host, port = KANATA_ADDR.rsplit(":", 1)
@@ -883,7 +910,7 @@ class App(Gtk.Application):
         windows = umbriel_windows()
         if self.icons is None:
             self.icons = AppIcons()
-        self.win = Expose(self, windows, self.icons, load_palette(), alt=alt)
+        self.win = Expose(self, windows, self.icons, self.apply_palette(), alt=alt)
         if alt:
             self.win.keyboard_used()
         self.win.present()
