@@ -19,6 +19,10 @@ It runs in the background with no tray icon; starting it again toggles it.
     expose-linux --list        print the windows it would show
     expose-linux --quit        stop the background program
 
+Alt+Tab: `expose-toggle next` / `prev` (bind them to Alt+Tab / Alt+Shift+Tab). The first press opens it; further Tab
+presses while Alt is held step through the windows in reading order (Shift: backwards); letting go of Alt then goes to the
+selected window at once. A plain Alt+Tab and release leaves it open (arrows + Enter, or click).
+
 Needs: python-gobject, gtk4, gtk4-layer-shell, and `expose-shots` (built by install.sh).
 """
 import ctypes.util
@@ -27,8 +31,10 @@ import json
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.parse
@@ -73,9 +79,10 @@ STARTUP_S = 0.6             # pointer events while the window opens are not move
 SLOWMO = float(os.environ.get("EXPOSE_SLOWMO", "1"))     # >1: play the animations slower (to look at them)
 OPEN_S = 0.32 * SLOWMO      # cards fly from their windows to the grid
 CLOSE_S = 0.24 * SLOWMO     # ... and back
+KANATA_ADDR = os.environ.get("KANATA_ADDR", "127.0.0.1:7070")      # Kanata's TCP server (--port): tells us when Alt is let go
 GAP = 30                    # between cards
 LABEL_H = 40                # the line under a thumbnail (icon + title)
-MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 40, 56, 48
+MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 28, 26, 26
 
 FALLBACK = {
     "mPrimary": "#b4befe", "mOnPrimary": "#1e1e2e", "mSurface": "#1e1e2e", "mOnSurface": "#cdd6f4",
@@ -320,10 +327,14 @@ class Card(Gtk.Box):
 
 
 class Expose(Gtk.ApplicationWindow):
-    def __init__(self, app, windows, icons, palette, mru=(), step=None):
+    def __init__(self, app, windows, icons, palette, alt=False):
         super().__init__(application=app)
-        self.mru = list(mru)                 # window ids, the one used last first
-        self.step_at_start = step            # None, "next" or "prev": opened by Alt+Tab
+        self.alt_held = alt                  # opened by Alt+Tab: Alt is down (until its release is seen)
+        self.alt_steps = 0                   # Tab presses on top of the one that opened it, while Alt is down
+        self.alt_seen = time.monotonic()
+        self.alt_timer = 0
+        if alt:
+            self.ensure_watch()
         self.progress = 0.0                  # 0 = cards on their windows, 1 = in the grid
         self.anim_id = 0
         self.palette = palette
@@ -423,8 +434,6 @@ class Expose(Gtk.ApplicationWindow):
         focused = next((i for i, c in enumerate(self.cards) if c.win.get("focused")), 0)
         self.layout_cards()
         self.select(focused)
-        if self.step_at_start:
-            self.step(self.step_at_start)
 
     def layout_cards(self):
         if not self.cards:
@@ -436,6 +445,8 @@ class Expose(Gtk.ApplicationWindow):
             c.resize(height)
             c.shot_w, c.shot_h = int(height * c.aspect), int(height)
         block_h = len(rows) * (height + LABEL_H + 14) + (len(rows) - 1) * GAP
+        row_gap = GAP + (min(max(0.0, area_h - block_h) / (len(rows) - 1), 46) if len(rows) > 1 else 0)   # use spare height
+        block_h += (row_gap - GAP) * (len(rows) - 1)
         y = MARGIN_TOP + (area_h - block_h) / 2
         for row in rows:
             row_w = sum(self.cards[i].aspect * height + 16 for i in row) + GAP * (len(row) - 1)
@@ -445,7 +456,7 @@ class Expose(Gtk.ApplicationWindow):
                 self.board.move(c, x, y)
                 c.fx, c.fy = x, y
                 x += c.aspect * height + 16 + GAP
-            y += height + LABEL_H + 14 + GAP
+            y += height + LABEL_H + 14 + row_gap
 
     # -- the flight: cards zoom from where their windows are to the grid, and back ---------------------------------
 
@@ -555,24 +566,24 @@ class Expose(Gtk.ApplicationWindow):
         self.sel = index
         self.cards[index].add_css_class("selected")
 
-    def mru_cards(self):
-        """The cards, the window used last first (windows never seen in use follow in strip order)."""
-        rank = {wid: i for i, wid in enumerate(self.mru)}
-        return sorted(self.cards, key=lambda c: rank.get(c.win_id, len(rank) + self.cards.index(c)))
-
-    def step(self, which):
-        """Alt+Tab (next) / Alt+Shift+Tab (prev): through the windows in the order they were used."""
-        order = self.mru_cards()
-        if not order:
+    def step(self, which, from_alt=False):
+        """Next / previous card in reading order (rows left to right), skipping cards a typed filter dimmed.
+        from_alt: it came from Alt+Tab / Alt+Shift+Tab; releasing Alt then goes to the selected window."""
+        if from_alt:
+            self.alt_held = True
+            self.alt_seen = time.monotonic()
+            self.alt_steps += 1
+            self.ensure_watch()
+        n = len(self.cards)
+        if not n:
             return
-        current = self.cards[self.sel] if self.sel < len(self.cards) else order[0]
-        if self.step_at_start and not getattr(self, "stepped", False):
-            self.stepped = True
-            self.select(self.cards.index(order[1 % len(order)] if which == "next" else order[-1]))
-            return
-        self.stepped = True
-        i = order.index(current) if current in order else 0
-        self.select(self.cards.index(order[(i + (1 if which == "next" else -1)) % len(order)]))
+        direction = 1 if which == "next" else -1
+        i = self.sel
+        for _ in range(n):
+            i = (i + direction) % n
+            if not self.cards[i].has_css_class("dim"):
+                self.select(i)
+                return
 
     def centre(self, card):
         ok, rect = card.compute_bounds(self.board)
@@ -666,7 +677,6 @@ class Expose(Gtk.ApplicationWindow):
         elif name == "Down":
             self.move(0, 1)
         elif name in ("Tab", "ISO_Left_Tab"):
-            self.stepped = True
             self.step("prev" if (state & Gdk.ModifierType.SHIFT_MASK) else "next")
         elif name in ("Delete", "BackSpace"):
             if self.typed:
@@ -683,6 +693,37 @@ class Expose(Gtk.ApplicationWindow):
                 self.type_timer = GLib.timeout_add(int(TYPE_RESET_S * 1000), self.type_expired)
                 self.apply_filter()
         return Gdk.EVENT_STOP
+
+    def ensure_watch(self):
+        if not self.alt_timer:
+            self.alt_timer = GLib.timeout_add(30, self.watch_alt)
+
+    def watch_alt(self):
+        """Alt+Tab: Alt is down while it opens. GTK only reports Alt's release as a key event to the window that saw
+        its press, so look at the keyboard's modifier state every 30 ms instead. Letting go of Alt after Tab was pressed
+        again goes to the selected window at once; a plain Alt+Tab and release stays open."""
+        seat = self.get_display().get_default_seat()
+        keyboard = seat.get_keyboard() if seat else None
+        app = self.get_application()
+        # With Kanata (Win = Command, Alt = Option) a held Alt is Kanata's layer "opt"; Alt+Tab reaches the compositor as a
+        # quick Alt+Tab that is already released. In a terminal Alt is the real one, which GTK sees.
+        down = bool(keyboard and keyboard.get_modifier_state() & Gdk.ModifierType.ALT_MASK) \
+            or (app.kanata_ok and app.layer == "opt")
+        if os.environ.get("EXPOSE_DEBUG"):
+            print("alt", down, self.alt_held, self.alt_steps, file=sys.stderr, flush=True)
+        if self.closing or not self.alt_held:
+            self.alt_timer = 0
+            return GLib.SOURCE_REMOVE
+        if down:
+            self.alt_seen = time.monotonic()
+            return GLib.SOURCE_CONTINUE
+        if time.monotonic() - self.alt_seen < (0.05 if app.kanata_ok else 0.3):     # the state can lag a moment
+            return GLib.SOURCE_CONTINUE
+        self.alt_held = False
+        self.alt_timer = 0
+        if self.alt_steps > 0 and self.cards:
+            self.activate(self.cards[self.sel])
+        return GLib.SOURCE_REMOVE
 
     def type_expired(self):
         self.type_timer = 0
@@ -767,9 +808,8 @@ class App(Gtk.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.win = None
         self.icons = None
-        self.mru = []                 # window ids, the one used last first (kept from `umbriel subscribe windows`)
-        self.sub = None
-        self.sub_retry = 0
+        self.layer = "base"           # Kanata's active layer ("opt" = Alt is held), from its TCP server
+        self.kanata_ok = False
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -778,7 +818,32 @@ class App(Gtk.Application):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", lambda a, p, name=name: self.step(name))
             self.add_action(action)
-        self.watch_windows()
+        threading.Thread(target=self.kanata_loop, daemon=True).start()
+
+    def kanata_loop(self):
+        host, port = KANATA_ADDR.rsplit(":", 1)
+        while True:
+            try:
+                with socket.create_connection((host, int(port)), timeout=2) as conn:
+                    conn.settimeout(None)
+                    GLib.idle_add(self.set_kanata, True, None)
+                    for line in conn.makefile():
+                        try:
+                            new = json.loads(line).get("LayerChange", {}).get("new")
+                        except (ValueError, AttributeError):
+                            continue
+                        if new:
+                            GLib.idle_add(self.set_kanata, True, new)
+            except OSError:
+                pass
+            GLib.idle_add(self.set_kanata, False, "base")
+            time.sleep(5)
+
+    def set_kanata(self, ok, layer):
+        self.kanata_ok = ok
+        if layer:
+            self.layer = layer
+        return GLib.SOURCE_REMOVE
 
     def do_activate(self):                           # `gdbus call ... org.freedesktop.Application.Activate`: the fast toggle
         self.toggle()
@@ -797,51 +862,14 @@ class App(Gtk.Application):
         self.toggle()
         return 0
 
-    # -- which window was used last ---------------------------------------------------------------------------------
-
-    def watch_windows(self):
-        self.note_windows(umbriel_windows())
-        try:
-            self.sub = Gio.Subprocess.new(["umbriel", "subscribe", "windows"], Gio.SubprocessFlags.STDOUT_PIPE)
-        except GLib.Error:
-            self.sub = None
-            GLib.timeout_add_seconds(5, lambda: self.watch_windows() and False)
-            return
-        stream = Gio.DataInputStream.new(self.sub.get_stdout_pipe())
-        stream.read_line_async(GLib.PRIORITY_LOW, None, self.on_event_line, stream)
-
-    def on_event_line(self, stream, result, _):
-        try:
-            line, _len = stream.read_line_finish_utf8(result)
-        except GLib.Error:
-            line = None
-        if line is None:                              # the compositor restarted or went away: try again later
-            GLib.timeout_add_seconds(5, lambda: self.watch_windows() and False)
-            return
-        try:
-            data = json.loads(line).get("data")
-        except (ValueError, AttributeError):
-            data = None
-        if isinstance(data, list):
-            self.note_windows(data)
-        stream.read_line_async(GLib.PRIORITY_LOW, None, self.on_event_line, stream)
-
-    def note_windows(self, windows):
-        alive = [w.get("id") for w in windows if w.get("id")]
-        focused = next((w["id"] for w in windows if w.get("focused") and w.get("id")), None)
-        order = [i for i in self.mru if i in alive]
-        order += [i for i in alive if i not in order]
-        if focused:
-            order = [focused] + [i for i in order if i != focused]
-        self.mru = order
-
     # -- open / close ------------------------------------------------------------------------------------------------
 
     def step(self, which):
+        """Alt+Tab / Alt+Shift+Tab: the first one opens it, the next ones step on."""
         if self.win is None:
-            self.open(step=which)
+            self.open(alt=True)
         else:
-            self.win.step(which)
+            self.win.step(which, from_alt=True)
             self.win.keyboard_used()
 
     def toggle(self):
@@ -851,13 +879,12 @@ class App(Gtk.Application):
             self.open()
         return GLib.SOURCE_REMOVE
 
-    def open(self, step=None):
+    def open(self, alt=False):
         windows = umbriel_windows()
-        self.note_windows(windows)
         if self.icons is None:
             self.icons = AppIcons()
-        self.win = Expose(self, windows, self.icons, load_palette(), mru=self.mru, step=step)
-        if step:
+        self.win = Expose(self, windows, self.icons, load_palette(), alt=alt)
+        if alt:
             self.win.keyboard_used()
         self.win.present()
 

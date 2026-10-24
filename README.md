@@ -10,9 +10,12 @@ GTK4 + gtk4-layer-shell for the overlay and a small C helper for the window pict
 - **Live pictures** of every window, also those on other desktops or scrolled out of view, taken with
   `ext-image-copy-capture` (`tools/expose-shots.c`); the last pictures show at once while fresh ones arrive.
 - Colours from the active Noctalia palette, font from GTK, blur from an Umbriel layer rule (below).
-- **Alt+Tab mode**: `expose-toggle next` / `prev` open it with the window you used before this one selected, and step on
-  through the windows in the order you used them (it follows Umbriel's window events to know that order). Bind them
-  to Alt+Tab / Alt+Shift+Tab and it works as an app switcher that shows everything.
+- **Alt+Tab mode**: `expose-toggle next` / `prev`, bound to Alt+Tab / Alt+Shift+Tab. The first press opens it. While Alt is
+  held, each further Tab selects the next window in reading order (Shift+Tab: the previous one); letting go of Alt goes to the
+  selected window at once. A plain Alt+Tab and release leaves it open: arrows + Enter, or click. Seeing that Alt was
+  released needs help when a key remapper turns Alt+Tab into a quick Alt+Tab (Kanata does here): it listens to
+  Kanata's TCP server (`--port 127.0.0.1:7070`, layer `opt` = Alt held; `KANATA_ADDR` to change) and otherwise
+  looks at the keyboard's modifier state.
 - **Animation**: the cards fly from where their windows are to the grid and back (windows that are not on screen grow
   in place); the backdrop fades. `EXPOSE_SLOWMO=8` plays it slower.
 - Runs in the background (no tray icon); `expose-toggle` opens it in milliseconds.
