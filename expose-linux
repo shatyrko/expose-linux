@@ -9,7 +9,7 @@ keyboard is used, and hovering selects only after the mouse really moves.
 
 The pictures come from `expose-shots` (ext-image-copy-capture, one frame of each window, also those on other desktops
 or scrolled out of view); the window list, focusing and closing go through `umbriel` (JSON window list, the actions
-window-focus:<id> and window-close:<id>). Colours come from the active Noctalia palette, the font from the GTK setting,
+window-focus <id> and window-close <id>). Colours come from the active Noctalia palette, the font from the GTK setting,
 the blur from the compositor (Umbriel layer rule for the namespace "expose-linux").
 
 It runs in the background with no tray icon; starting it again toggles it.

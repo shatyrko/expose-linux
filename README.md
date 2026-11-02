@@ -39,14 +39,17 @@ blur_ignore_alpha = 0.1
 blur_optimized = false
 
 [keybinds]
-"Mod+Alt+Up" = { action = "spawn:expose-toggle", repeat = false }
-"Alt+Tab" = { action = "spawn:expose-toggle next", repeat = true }
-"Alt+Shift+Tab" = { action = "spawn:expose-toggle prev", repeat = true }
+"Mod+Alt+Up" = { action = "spawn expose-toggle", repeat = false }
+"Alt+Tab" = { action = "spawn expose-toggle next", repeat = true }
+"Alt+Shift+Tab" = { action = "spawn expose-toggle prev", repeat = true }
 ```
 
-It uses `umbriel windows --json` for the window list and the actions `window-focus:<id>` / `window-close:<id>`
+It uses `umbriel windows --json` for the window list and the actions `window-focus <id>` / `window-close <id>`
 (the window `id` is the same string as the ext-foreign-toplevel identifier). Other compositors that offer the same
 capture protocols and a way to focus / close a window by id could be supported by changing `umbriel_windows()` and
 `umbriel_msg()` in `expose-linux`.
+
+This needs an Umbriel from 2026-10-29 or later, which takes actions as words (`window-focus <id>`, `spawn cmd`).
+Older builds used `window-focus:<id>` and `spawn:cmd`.
 
 `expose-linux --list` prints the windows it would show.
