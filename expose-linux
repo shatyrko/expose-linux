@@ -189,9 +189,9 @@ def sorted_windows(wins: list) -> list:
     return sorted(wins, key=key)
 
 
-def umbriel_msg(action: str):
+def umbriel_msg(*words: str):
     try:
-        subprocess.Popen(["umbriel", "msg", action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["umbriel", "msg", *words], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as err:
         print(f"expose-linux: umbriel msg failed: {err}", file=sys.stderr)
 
@@ -765,11 +765,11 @@ class Expose(Gtk.ApplicationWindow):
     # -- doing things ----------------------------------------------------------------------------------------------
 
     def activate(self, card):
-        umbriel_msg(f"window-focus:{card.win_id}")
+        umbriel_msg("window-focus", str(card.win_id))
         self.close_pad()
 
     def close_window(self, card):
-        umbriel_msg(f"window-close:{card.win_id}")
+        umbriel_msg("window-close", str(card.win_id))
         GLib.timeout_add(450, self.refresh_windows)
 
     def refresh_windows(self):
